@@ -1,0 +1,139 @@
+name: Verify Selectors
+
+on:
+  schedule:
+    - cron: '17 3 * * *'  # 每日 UTC 03:17 (北京时间 11:17)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/spreado/plugins/**'
+      - 'src/spreado/core/**'
+      - 'scripts/verify_selectors.py'
+      - '.github/workflows/verify-selectors.yml'
+
+permissions:
+  contents: write  # 允许 workflow commit 报告回仓库
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # commit 报告需要 token；scheduled run 用默认 GITHUB_TOKEN
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Materialize platform cookies from secrets
+        env:
+          COOKIE_XIAOHONGSHU: ${{ secrets.COOKIE_XIAOHONGSHU }}
+          COOKIE_DOUYIN: ${{ secrets.COOKIE_DOUYIN }}
+          COOKIE_KUAISHOU: ${{ secrets.COOKIE_KUAISHOU }}
+          COOKIE_SHIPINHAO: ${{ secrets.COOKIE_SHIPINHAO }}
+        run: |
+          set -e
+          mkdir -p ci-cookies
+          write_cookie() {
+            local platform="$1"
+            local content="$2"
+            if [ -z "$content" ]; then
+              echo "::notice::secret COOKIE_${platform^^} 未配置，跳过 $platform 已登录态校验"
+              return
+            fi
+            local dir="ci-cookies/${platform}_uploader"
+            mkdir -p "$dir"
+            # 关闭 echo，避免 token 落入日志
+            set +x
+            printf '%s' "$content" > "$dir/account.json"
+            # 校验 JSON 合法
+            if ! python -c "import json,sys; json.load(open('$dir/account.json'))" 2>/dev/null; then
+              echo "::error::COOKIE_${platform^^} 不是合法 JSON"
+              exit 1
+            fi
+            echo "::notice::已落地 $platform cookie"
+          }
+          write_cookie xiaohongshu "$COOKIE_XIAOHONGSHU"
+          write_cookie douyin "$COOKIE_DOUYIN"
+          write_cookie kuaishou "$COOKIE_KUAISHOU"
+          write_cookie shipinhao "$COOKIE_SHIPINHAO"
+
+      - name: Run selector verification
+        id: verify
+        # 不加 strict：CI 没 cookie，PARTIAL 是预期；只对 BROKEN/UNREACHABLE 返回非 0
+        run: uv run python scripts/verify_selectors.py --cookies-dir ci-cookies
+        continue-on-error: true
+
+      - name: Run E2E test (dry-run)
+        id: e2e
+        # dry-run：走完上传流程但不实际发布；无 cookie 的平台自动跳过
+        run: uv run python scripts/e2e_test.py --cookies-dir ci-cookies
+        continue-on-error: true
+
+      - name: Clean up cookie files
+        if: always()
+        run: rm -rf ci-cookies
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-check-reports
+          path: |
+            reports/selector-check-*.md
+            reports/e2e-check-*.md
+          retention-days: 30
+
+      - name: Commit report
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 清理旧归档，只保留最近 10 个（按时间戳排序）
+          cd reports
+          for prefix in selector-check e2e-check; do
+            archived=$(ls -1 ${prefix}-????????T??????.md 2>/dev/null | sort -r | tail -n +11)
+            if [ -n "$archived" ]; then
+              echo "清理旧报告: $archived"
+              echo "$archived" | xargs rm -f
+            fi
+          done
+          cd ..
+          git add reports/selector-check-latest.md reports/selector-check-*.md \
+                  reports/e2e-check-latest.md reports/e2e-check-*.md
+          if git diff --cached --quiet; then
+            echo "报告无变化，跳过 commit"
+            exit 0
+          fi
+          git commit -m "chore(ci): 更新平台健康度报告 [skip ci]"
+          # PR 触发时跳过推送（报告已作为 artifact 上传，且并发推送会导致冲突）
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "PR 触发，不推送报告回分支（见 artifact）"
+            exit 0
+          fi
+          # schedule / workflow_dispatch：推送回触发分支
+          PUSH_REF="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
+          if [ "$PUSH_REF" = "HEAD" ]; then
+            echo "无法确定目标分支，跳过 push"
+            exit 0
+          fi
+          git push origin HEAD:"$PUSH_REF"
+
+      - name: Fail job if verification failed
+        if: steps.verify.outcome == 'failure' || steps.e2e.outcome == 'failure'
+        run: |
+          echo "::error::存在失败的平台检测，详见上传的报告。"
+          exit 1

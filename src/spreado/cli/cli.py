@@ -1,0 +1,510 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Spreado CLI 命令行工具 (异步版本)
+
+重构版本：使用 PluginLoader 动态发现插件，不再硬编码平台映射。
+"""
+
+import argparse
+import sys
+import asyncio
+import platform
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List
+
+from ..plugin_loader import get_plugin_loader
+from ..utils import get_logger
+
+from .. import __logo__, __version__, __author__, __email__
+
+# Logo
+_EMAIL_LINE = f"\n           邮箱: {__email__}" if __email__ else ""
+LOGO = """
+{}
+
+           全平台内容发布工具 v{}
+           作者: {}{}
+""".format(__logo__, __version__, __author__, _EMAIL_LINE)
+
+
+def _install_windows_asyncio_unraisable_filter() -> None:
+    """Suppress noisy Playwright/asyncio cleanup errors on Windows.
+
+    Python 3.13 on Windows may print "Exception ignored in ..." for closed
+    subprocess pipes after Playwright has already finished successfully. These
+    are emitted through sys.unraisablehook during object finalization, so normal
+    try/except blocks cannot catch them.
+    """
+    if platform.system().lower() != "windows":
+        return
+
+    original_hook = sys.unraisablehook
+
+    def hook(unraisable):
+        exc = unraisable.exc_value
+        obj = unraisable.object
+        obj_module = getattr(obj, "__module__", "")
+        obj_name = getattr(obj, "__qualname__", getattr(obj, "__name__", ""))
+        msg = str(exc)
+
+        is_closed_pipe_noise = (
+            isinstance(exc, (ValueError, RuntimeError))
+            and (
+                "I/O operation on closed pipe" in msg
+                or "Event loop is closed" in msg
+            )
+            and (
+                obj_module.startswith("asyncio.")
+                or "BaseSubprocessTransport" in obj_name
+                or "_ProactorBasePipeTransport" in obj_name
+            )
+        )
+        if is_closed_pipe_noise:
+            return
+
+        original_hook(unraisable)
+
+    sys.unraisablehook = hook
+
+
+def _get_platform_names() -> dict:
+    """动态获取平台名映射 {platform_name: display_name}"""
+    loader = get_plugin_loader()
+    return loader.list_publishers()
+
+
+def _get_platform_choices(include_all: bool = False) -> List[str]:
+    """动态获取平台 choices 列表"""
+    loader = get_plugin_loader()
+    names = loader.list_publisher_names()
+    if include_all:
+        names = names + ["all"]
+    return names
+
+
+def get_publisher(platform: str, cookies: str = None):
+    """获取发布器实例"""
+    loader = get_plugin_loader()
+    publisher = loader.get_publisher(platform, cookie_file_path=cookies)
+    if not publisher:
+        raise ValueError(f"不支持的平台: {platform}")
+    return publisher
+
+
+async def login_single_platform(platform: str, args, logger) -> bool:
+    """登录单个平台"""
+    platform_names = _get_platform_names()
+    platform_name = platform_names.get(platform, platform)
+    logger.info(f"登录平台: {platform_name}")
+
+    try:
+        publisher = get_publisher(platform=platform, cookies=args.cookies)
+        result = await publisher.login_flow()
+
+        if result:
+            logger.info(f"✓ {platform_name} 登录成功")
+            return True
+        else:
+            logger.error(f"✗ {platform_name} 登录失败")
+            return False
+
+    except Exception as e:
+        logger.error(f"✗ {platform_name} 登录异常: {e}")
+        if args.debug:
+            import traceback
+
+            traceback.print_exc()
+        return False
+
+
+async def cmd_login(args):
+    """登录命令"""
+    logger = get_logger("LOGIN")
+
+    platform = args.platform
+    platform_names = _get_platform_names()
+    platform_name = platform_names.get(platform, platform)
+
+    print(f"\n{'=' * 50}")
+    print(f"登录平台: {platform_name}")
+    print(f"{'=' * 50}")
+
+    result = await login_single_platform(platform, args, logger)
+
+    print(f"\n{'=' * 50}")
+    if result:
+        print(f"✓ {platform_name} 登录成功")
+    else:
+        print(f"✗ {platform_name} 登录失败")
+    print(f"{'=' * 50}\n")
+
+    return 0 if result else 1
+
+
+async def verify_single_platform(platform: str, args, logger) -> bool:
+    """验证单个平台 Cookie"""
+    platform_names = _get_platform_names()
+    platform_name = platform_names.get(platform, platform)
+
+    try:
+        publisher = get_publisher(platform=platform, cookies=args.cookies)
+        result = await publisher.verify_cookie_flow()
+
+        if result:
+            logger.info(f"✓ {platform_name} Cookie 有效")
+            return True
+        else:
+            logger.warning(f"✗ {platform_name} Cookie 无效或已过期")
+            return False
+
+    except Exception as e:
+        logger.error(f"✗ {platform_name} 验证异常: {e}")
+        if args.debug:
+            import traceback
+
+            traceback.print_exc()
+        return False
+
+
+async def cmd_verify(args):
+    """验证 Cookie 命令"""
+    logger = get_logger("VERIFY")
+
+    loader = get_plugin_loader()
+    platforms = (
+        loader.list_publisher_names() if args.platform == "all" else [args.platform]
+    )
+
+    print(f"\n{'=' * 50}")
+    print("验证 Cookie 状态")
+    print(f"{'=' * 50}")
+
+    if args.parallel and len(platforms) > 1:
+        tasks = [verify_single_platform(p, args, logger) for p in platforms]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success_count = sum(1 for r in results if r is True)
+        fail_count = len(results) - success_count
+    else:
+        success_count = 0
+        fail_count = 0
+        for platform in platforms:
+            result = await verify_single_platform(platform, args, logger)
+            if result:
+                success_count += 1
+            else:
+                fail_count += 1
+
+    print(f"\n{'=' * 50}")
+    print(f"验证完成: 有效 {success_count} 个, 无效 {fail_count} 个")
+    print(f"{'=' * 50}\n")
+
+    return 0 if fail_count == 0 else 1
+
+
+async def upload_single_platform(
+    platform: str,
+    video_path: Path,
+    title: str,
+    content: str,
+    tags: List[str],
+    publish_date: datetime,
+    thumbnail_path: Path,
+    args,
+    logger,
+) -> bool:
+    """上传到单个平台"""
+    platform_names = _get_platform_names()
+    platform_name = platform_names.get(platform, platform)
+    logger.info(f"开始上传到: {platform_name}")
+
+    try:
+        publisher = get_publisher(platform=platform, cookies=args.cookies)
+
+        result = await publisher.upload_video_flow(
+            file_path=video_path,
+            title=title,
+            content=content,
+            tags=tags,
+            publish_date=publish_date,
+            thumbnail_path=thumbnail_path,
+        )
+
+        if result:
+            logger.info(f"✓ {platform_name} 上传成功")
+            return True
+        else:
+            logger.error(f"✗ {platform_name} 上传失败")
+            return False
+
+    except Exception as e:
+        logger.error(f"✗ {platform_name} 上传异常: {e}")
+        if args.debug:
+            import traceback
+
+            traceback.print_exc()
+        return False
+
+
+async def cmd_upload(args):
+    """上传视频命令"""
+    logger = get_logger("UPLOAD")
+
+    video_path = Path(args.video)
+    if not video_path.exists():
+        logger.error(f"视频文件不存在: {args.video}")
+        return 1
+
+    thumbnail_path = None
+    if args.cover:
+        thumbnail_path = Path(args.cover)
+        if not thumbnail_path.exists():
+            logger.error(f"封面文件不存在: {args.cover}")
+            return 1
+
+    tags = []
+    if args.tags:
+        tags = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+
+    publish_date = None
+    if args.schedule:
+        try:
+            if args.schedule.isdigit():
+                hours = int(args.schedule)
+                publish_date = datetime.now() + timedelta(hours=hours)
+            else:
+                publish_date = datetime.strptime(args.schedule, "%Y-%m-%d %H:%M")
+        except ValueError:
+            logger.error(f"无效的发布时间格式: {args.schedule}")
+            logger.info("支持格式: 数字(小时) 或 'YYYY-MM-DD HH:MM'")
+            return 1
+
+    loader = get_plugin_loader()
+    platforms = (
+        loader.list_publisher_names() if args.platform == "all" else [args.platform]
+    )
+    platform_names = _get_platform_names()
+
+    print(f"\n{'=' * 50}")
+    print("上传任务")
+    print(f"{'=' * 50}")
+    print(f"  视频: {video_path.name}")
+    print(f"  标题: {args.title or '(无)'}")
+    print(f"  标签: {', '.join(tags) if tags else '(无)'}")
+    print(f"  封面: {thumbnail_path.name if thumbnail_path else '(无)'}")
+    print(
+        f"  定时: {publish_date.strftime('%Y-%m-%d %H:%M') if publish_date else '立即发布'}"
+    )
+    print(f"  平台: {', '.join(platform_names.get(p, p) for p in platforms)}")
+    print(f"{'=' * 50}\n")
+
+    if args.parallel and len(platforms) > 1:
+        logger.info("使用并行模式上传...")
+        tasks = [
+            upload_single_platform(
+                platform=p,
+                video_path=video_path,
+                title=args.title or "",
+                content=args.content or "",
+                tags=tags,
+                publish_date=publish_date,
+                thumbnail_path=thumbnail_path,
+                args=args,
+                logger=logger,
+            )
+            for p in platforms
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success_count = sum(1 for r in results if r is True)
+        fail_count = len(results) - success_count
+    else:
+        success_count = 0
+        fail_count = 0
+        for platform in platforms:
+            print(f"\n{'-' * 50}")
+            result = await upload_single_platform(
+                platform=platform,
+                video_path=video_path,
+                title=args.title or "",
+                content=args.content or "",
+                tags=tags,
+                publish_date=publish_date,
+                thumbnail_path=thumbnail_path,
+                args=args,
+                logger=logger,
+            )
+            if result:
+                success_count += 1
+            else:
+                fail_count += 1
+
+    print(f"\n{'=' * 50}")
+    print(f"上传完成: 成功 {success_count} 个, 失败 {fail_count} 个")
+    print(f"{'=' * 50}\n")
+
+    return 0 if fail_count == 0 else 1
+
+
+async def cmd_list(args):
+    """列出所有可用平台插件"""
+    loader = get_plugin_loader()
+    publishers = loader.list_publishers()
+
+    print(f"\n{'=' * 50}")
+    print("已注册的平台插件")
+    print(f"{'=' * 50}")
+
+    if not publishers:
+        print("  (无)")
+    else:
+        for name, display in sorted(publishers.items()):
+            print(f"  {name:15s} -- {display}")
+
+    print(f"\n  共 {len(publishers)} 个平台插件")
+    print(f"{'=' * 50}\n")
+    return 0
+
+
+def create_parser():
+    """创建命令行解析器"""
+    parser = argparse.ArgumentParser(
+        prog="fansai",
+        description="FANSAI - 全平台内容发布工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 列出可用平台
+  fansai list
+
+  # 登录平台
+  fansai login douyin
+
+  # 验证 Cookie
+  fansai verify douyin
+  fansai verify all --parallel
+
+  # 上传视频
+  fansai upload douyin --video video.mp4 --title "标题"
+  fansai upload all --video video.mp4 --parallel
+""",
+    )
+
+    parser.add_argument(
+        "-v", "--version", action="version", version=f"Spreado {__version__}"
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="命令",
+        description="可用命令",
+        help="使用 fansai <命令> --help 查看详细帮助",
+    )
+
+    # ==================== list 命令 ====================
+    list_parser = subparsers.add_parser(
+        "list",
+        help="列出所有可用平台插件",
+        description="列出所有已注册的平台插件",
+    )
+    list_parser.set_defaults(func=cmd_list)
+
+    # ==================== login 命令 ====================
+    login_parser = subparsers.add_parser(
+        "login",
+        help="登录平台获取 Cookie",
+        description="登录指定平台，获取并保存 Cookie",
+    )
+    login_parser.add_argument(
+        "platform",
+        choices=_get_platform_choices(include_all=False),
+        help="目标平台",
+    )
+    login_parser.add_argument("--cookies", type=str, help="Cookie 保存路径")
+    login_parser.add_argument("--debug", action="store_true", help="调试模式")
+    login_parser.set_defaults(func=cmd_login)
+
+    # ==================== verify 命令 ====================
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="验证 Cookie 是否有效",
+        description="验证指定平台的 Cookie 是否有效",
+    )
+    verify_parser.add_argument(
+        "platform",
+        choices=_get_platform_choices(include_all=True),
+        help="目标平台 (all 表示所有平台)",
+    )
+    verify_parser.add_argument("--cookies", type=str, help="Cookie 文件路径")
+    verify_parser.add_argument(
+        "--parallel", "-p", action="store_true", help="并行验证多个平台"
+    )
+    verify_parser.add_argument("--debug", action="store_true", help="调试模式")
+    verify_parser.set_defaults(func=cmd_verify)
+
+    # ==================== upload 命令 ====================
+    upload_parser = subparsers.add_parser(
+        "upload", help="上传视频", description="上传视频到指定平台"
+    )
+    upload_parser.add_argument(
+        "platform",
+        choices=_get_platform_choices(include_all=True),
+        help="目标平台 (all 表示所有平台)",
+    )
+    upload_parser.add_argument(
+        "--video", "-V", required=True, type=str, help="视频文件路径"
+    )
+    upload_parser.add_argument("--title", "-t", type=str, default="", help="视频标题")
+    upload_parser.add_argument(
+        "--content", "-c", type=str, default="", help="视频描述/正文"
+    )
+    upload_parser.add_argument(
+        "--tags", type=str, default="", help="视频标签，多个用逗号分隔"
+    )
+    upload_parser.add_argument("--cover", type=str, help="封面图片路径")
+    upload_parser.add_argument(
+        "--schedule", type=str, help='定时发布 (小时数 或 "YYYY-MM-DD HH:MM")'
+    )
+    upload_parser.add_argument("--cookies", type=str, help="Cookie 文件路径")
+    upload_parser.add_argument(
+        "--parallel", "-p", action="store_true", help="并行上传到多个平台"
+    )
+    upload_parser.add_argument("--debug", action="store_true", help="调试模式")
+    upload_parser.set_defaults(func=cmd_upload)
+
+    return parser
+
+
+async def async_main():
+    """异步主函数"""
+    print(LOGO)
+
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    return await args.func(args)
+
+
+def main():
+    """主函数入口"""
+    _install_windows_asyncio_unraisable_filter()
+    try:
+        if sys.version_info >= (3, 10):
+            return asyncio.run(async_main())
+        else:
+            loop = asyncio.get_event_loop()
+            try:
+                return loop.run_until_complete(async_main())
+            finally:
+                loop.close()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  用户中断操作\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

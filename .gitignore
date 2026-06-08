@@ -1,0 +1,15 @@
+.idea
+.vscode
+.venv
+.ruff_cache
+.playwright-cli
+**/.DS_Store
+**/logs
+**/cookies
+**/__pycache__
+
+build
+cookies
+dist
+build.spec
+spreado.egg-info
