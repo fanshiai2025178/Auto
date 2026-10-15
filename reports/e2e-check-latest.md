@@ -1,6 +1,6 @@
 # E2E 测试报告
 
-- 生成时间: `2026-10-14T16:50:02+08:00`
+- 生成时间: `2026-10-15T16:25:05+08:00`
 - 测试视频: `/home/runner/work/Auto/Auto/src/spreado/examples/videos/demo.mp4`
 
 ## 结果汇总
